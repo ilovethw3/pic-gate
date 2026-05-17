@@ -1,0 +1,341 @@
+{% extends "base.html" %}
+
+{% block title %}缓存管理 - PicGate 管理后台{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>缓存管理</h1>
+    <p>管理本地图片缓存和 R2 上传</p>
+</div>
+
+<div class="stats-grid" id="statsGrid">
+    <div class="stat-card">
+        <div class="stat-icon">💾</div>
+        <div class="stat-content">
+            <div class="stat-value" id="localImages">-</div>
+            <div class="stat-label">本地图片</div>
+        </div>
+    </div>
+    
+    <div class="stat-card">
+        <div class="stat-icon">📦</div>
+        <div class="stat-content">
+            <div class="stat-value" id="diskUsage">-</div>
+            <div class="stat-label">磁盘占用</div>
+        </div>
+    </div>
+    
+    <div class="stat-card">
+        <div class="stat-icon">⏳</div>
+        <div class="stat-content">
+            <div class="stat-value" id="pendingUploads">-</div>
+            <div class="stat-label">等待上传</div>
+        </div>
+    </div>
+    
+    <div class="stat-card">
+        <div class="stat-icon">❌</div>
+        <div class="stat-content">
+            <div class="stat-value" id="failedUploads">-</div>
+            <div class="stat-label">上传失败</div>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <h2>缓存操作</h2>
+    </div>
+    <div class="card-body">
+        <div class="action-buttons">
+            <button onclick="triggerCleanup()" class="btn btn-warning">
+                🧹 清理过期缓存
+            </button>
+            <button onclick="clearAllLocal()" class="btn btn-danger">
+                🗑️ 清除所有本地缓存
+            </button>
+            <button onclick="uploadPending()" class="btn btn-success">
+                ☁️ 上传到 R2
+            </button>
+            <button onclick="retryUploads()" class="btn btn-primary">
+                🔄 重试失败上传
+            </button>
+            <button onclick="generateThumbnails()" class="btn btn-info">
+                🖼️ 生成缩略图
+            </button>
+        </div>
+        <p class="help-text">
+            <strong>清理过期缓存：</strong> 删除超过 TTL 的本地文件。<br>
+            <strong>清除所有本地缓存：</strong> 删除所有本地图片（保留元数据，可从 R2 恢复）。<br>
+            <strong>上传到 R2：</strong> 将待处理的图片上传到 R2 存储。<br>
+            <strong>重试失败上传：</strong> 重新尝试上传失败的图片。<br>
+            <strong>生成缩略图：</strong> 为所有本地图片生成预览缩略图，加快图片预览页面加载。
+        </p>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <h2>缓存信息</h2>
+    </div>
+    <div class="card-body">
+        <div class="info-table">
+            <div class="info-row">
+                <span class="info-label">缓存 TTL：</span>
+                <span class="info-value" id="cacheTtl">-</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">元数据保留期：</span>
+                <span class="info-value" id="metadataRetention">-</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">R2 已配置：</span>
+                <span class="info-value" id="r2Configured">-</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <h2>📦 缓存大小限制</h2>
+    </div>
+    <div class="card-body">
+        <div class="form-group">
+            <label for="maxCacheMb">最大本地缓存大小 (MB)</label>
+            <div class="input-group">
+                <input type="number" id="maxCacheMb" value="0" min="0" step="100" placeholder="0 = 不限制">
+                <button onclick="saveMaxCacheSize()" class="btn btn-primary">保存</button>
+            </div>
+            <small>设为 0 表示不限制。达到限制时自动清理最早的图片。当前使用：<span id="currentUsage">-</span></small>
+        </div>
+        <div id="cacheProgress" class="cache-progress" style="display: none;">
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressFill"></div>
+            </div>
+            <span class="progress-text" id="progressText"></span>
+        </div>
+    </div>
+</div>
+
+<div id="message" class="message" style="display: none;"></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  async function loadStats() {
+    try {
+      const response = await fetch("/admin/api/stats");
+      if (response.status === 401) {
+        window.location.href = "/admin/login";
+        return;
+      }
+      const stats = await response.json();
+
+      document.getElementById("localImages").textContent = stats.local_images;
+      document.getElementById("diskUsage").textContent =
+        stats.disk_usage_mb + " MB";
+      document.getElementById("pendingUploads").textContent =
+        stats.pending_uploads;
+      document.getElementById("failedUploads").textContent =
+        stats.failed_uploads;
+    } catch (err) {
+      console.error("加载统计信息失败:", err);
+    }
+  }
+
+  async function loadSettings() {
+    try {
+      const response = await fetch("/admin/api/settings");
+      if (response.ok) {
+        const settings = await response.json();
+        document.getElementById("cacheTtl").textContent =
+          settings.local_cache_ttl_hours + " 小时";
+        document.getElementById("metadataRetention").textContent =
+          settings.metadata_retention_days + " 天";
+        document.getElementById("r2Configured").textContent = settings.r2_bucket_name
+          ? "是 (" + settings.r2_bucket_name + ")"
+          : "否";
+        
+        // Max cache size
+        const maxMb = settings.max_local_cache_mb || 0;
+        document.getElementById("maxCacheMb").value = maxMb;
+      }
+    } catch (err) {
+      console.error("加载设置失败:", err);
+    }
+  }
+
+  async function updateCacheProgress() {
+    try {
+      const statsResp = await fetch("/admin/api/stats");
+      const stats = await statsResp.json();
+      
+      const settingsResp = await fetch("/admin/api/settings");
+      const settings = await settingsResp.json();
+      
+      const currentMb = stats.disk_usage_mb || 0;
+      const maxMb = settings.max_local_cache_mb || 0;
+      
+      document.getElementById("currentUsage").textContent = currentMb + " MB";
+      
+      const progressDiv = document.getElementById("cacheProgress");
+      if (maxMb > 0) {
+        progressDiv.style.display = "block";
+        const percent = Math.min(100, (currentMb / maxMb) * 100);
+        document.getElementById("progressFill").style.width = percent + "%";
+        document.getElementById("progressFill").className = 
+          "progress-fill" + (percent > 80 ? " warning" : "") + (percent > 95 ? " danger" : "");
+        document.getElementById("progressText").textContent = 
+          `${currentMb} / ${maxMb} MB (${percent.toFixed(1)}%)`;
+      } else {
+        progressDiv.style.display = "none";
+      }
+    } catch (err) {
+      console.error("更新缓存进度失败:", err);
+    }
+  }
+
+  async function saveMaxCacheSize() {
+    const maxMb = parseInt(document.getElementById("maxCacheMb").value) || 0;
+    
+    try {
+      const response = await fetch("/admin/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ max_local_cache_mb: maxMb })
+      });
+      
+      if (response.ok) {
+        showMessage("缓存大小限制已保存");
+        updateCacheProgress();
+      } else {
+        showMessage("保存失败", true);
+      }
+    } catch (err) {
+      showMessage("保存失败", true);
+    }
+  }
+
+  async function triggerCleanup() {
+    if (!confirm("这将删除过期的本地缓存文件。确认继续？")) {
+      return;
+    }
+
+    try {
+      const response = await fetch("/admin/api/cleanup", { method: "POST" });
+      const data = await response.json();
+      showMessage(data.message);
+      loadStats();
+      updateCacheProgress();
+    } catch (err) {
+      showMessage("清理失败", true);
+    }
+  }
+
+  async function clearAllLocal() {
+    if (!confirm("⚠️ 这将删除所有本地缓存的图片文件！\n\n如果图片已上传到 R2，可以从 R2 恢复。\n确认继续？")) {
+      return;
+    }
+
+    try {
+      const response = await fetch("/admin/api/clear-all-local", { method: "POST" });
+      const data = await response.json();
+      showMessage(data.message, !data.success);
+      loadStats();
+      updateCacheProgress();
+    } catch (err) {
+      showMessage("清除失败", true);
+    }
+  }
+
+  async function retryUploads() {
+    try {
+      const response = await fetch("/admin/api/retry-uploads", {
+        method: "POST",
+      });
+      const data = await response.json();
+      showMessage(data.message);
+      loadStats();
+    } catch (err) {
+      showMessage("重试上传失败", true);
+    }
+  }
+
+  async function uploadPending() {
+    try {
+      const response = await fetch("/admin/api/upload-pending", {
+        method: "POST",
+      });
+      const data = await response.json();
+      showMessage(data.message, !data.success);
+      loadStats();
+    } catch (err) {
+      showMessage("上传失败", true);
+    }
+  }
+
+  async function generateThumbnails() {
+    if (!confirm("这将为所有缺少缩略图的本地图片生成缩略图。\n图片较多时可能需要一段时间，确认继续？")) {
+      return;
+    }
+    
+    try {
+      showMessage("正在生成缩略图，请稍候...", false);
+      const response = await fetch("/admin/api/generate-thumbnails", {
+        method: "POST",
+      });
+      const data = await response.json();
+      showMessage(data.message, !data.success);
+    } catch (err) {
+      showMessage("生成缩略图失败", true);
+    }
+  }
+
+  function showMessage(msg, isError = false) {
+    const messageDiv = document.getElementById("message");
+    messageDiv.textContent = msg;
+    messageDiv.className = "message " + (isError ? "error" : "success");
+    messageDiv.style.display = "block";
+    setTimeout(() => (messageDiv.style.display = "none"), 5000);
+  }
+
+  loadStats();
+  loadSettings();
+  updateCacheProgress();
+  setInterval(loadStats, 30000);
+  setInterval(updateCacheProgress, 30000);
+</script>
+
+<style>
+  .cache-progress {
+    margin-top: 15px;
+  }
+  .progress-bar {
+    width: 100%;
+    height: 20px;
+    background: #e9ecef;
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: #28a745;
+    transition: width 0.3s;
+  }
+  .progress-fill.warning {
+    background: #ffc107;
+  }
+  .progress-fill.danger {
+    background: #dc3545;
+  }
+  .progress-text {
+    display: block;
+    text-align: center;
+    margin-top: 5px;
+    font-size: 12px;
+    color: #666;
+  }
+</style>
+{% endblock %}
+
