@@ -32,6 +32,17 @@ DATABASE_URL = os.getenv(
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "5643"))
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Upstream HTTP behavior
+UPSTREAM_TRUST_ENV = _env_bool("UPSTREAM_TRUST_ENV", False)
+
 # Session secret (generate random if not set)
 import secrets
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_hex(32))

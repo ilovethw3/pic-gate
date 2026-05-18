@@ -230,8 +230,16 @@ async def create_image(
     
     for item in upstream_response.get("data", []):
         b64_data = item.get("b64_json")
+        upstream_url = item.get("url")
+        if not b64_data and upstream_url:
+            result_data.append({
+                "url": upstream_url,
+                "revised_prompt": item.get("revised_prompt")  # Pass through if present
+            })
+            continue
+
         if not b64_data:
-            logger.warning("Upstream response missing b64_json data")
+            logger.warning("Upstream response missing b64_json/url data")
             continue
         
         try:
@@ -309,6 +317,14 @@ async def edit_image(
         return create_error_response("Missing required field: image", "invalid_request", 400)
     if not body.get("prompt"):
         return create_error_response("Missing required field: prompt", "invalid_request", 400)
+
+    def preserve_image_url(value):
+        if isinstance(value, str) and value.startswith(("http://", "https://", "data:image/")):
+            return value
+        return None
+
+    source_image_url = preserve_image_url(body.get("image"))
+    source_mask_url = preserve_image_url(body.get("mask"))
     
     # Create payload rewriter to convert URLs to base64
     rewriter = await create_rewriter(db, settings)
@@ -354,7 +370,9 @@ async def edit_image(
             model=settings.upstream_model_name or "dall-e-2",
             mask_base64=mask_base64,
             n=n,
-            size=size
+            size=size,
+            source_image_url=source_image_url,
+            source_mask_url=source_mask_url
         )
     except httpx.HTTPStatusError as e:
         logger.error(f"Upstream API error: {e}")
@@ -376,9 +394,9 @@ async def edit_image(
             502
         )
     except Exception as e:
-        logger.error(f"Unexpected error calling upstream: {e}")
+        logger.exception("Unexpected error calling upstream")
         return create_error_response(
-            "Internal error processing request",
+            f"Internal error processing request: {type(e).__name__}: {e}",
             "internal_error",
             500
         )
@@ -389,8 +407,16 @@ async def edit_image(
     
     for item in upstream_response.get("data", []):
         b64_data = item.get("b64_json")
+        upstream_url = item.get("url")
+        if not b64_data and upstream_url:
+            result_data.append({
+                "url": upstream_url,
+                "revised_prompt": item.get("revised_prompt")
+            })
+            continue
+
         if not b64_data:
-            logger.warning("Upstream response missing b64_json data")
+            logger.warning("Upstream response missing b64_json/url data")
             continue
         
         try:
