@@ -8,21 +8,28 @@ Phase C Implementation:
 - /v1/chat/completions - Multi-turn chat with image URL→base64 conversion
 """
 
+import asyncio
 import time
 import logging
 from typing import Optional, Any, Dict, List
-from fastapi import APIRouter, Request, Depends, HTTPException, Header
+from fastapi import APIRouter, Request, Depends, HTTPException, Header, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 import httpx
 
-from app.db import get_db
+from app.db import get_db, async_session_maker
 from app.services.settings_service import get_settings
 from app.services.upstream_client import UpstreamClient
 from app.services.image_store import ImageStore, is_base64_image
-from app.services.url_builder import get_public_base_url, build_image_url
+from app.services.url_builder import (
+    build_image_url,
+    build_image_url_sync,
+    get_public_base_url,
+    infer_base_url_from_request,
+)
 from app.services.payload_rewriter import PayloadRewriter, create_rewriter
+from app.services.task_store import TaskStore, task_to_response
 from app.routers.admin_api import add_log
 
 logger = logging.getLogger(__name__)
@@ -113,6 +120,23 @@ def create_error_response(message: str, error_type: str = "api_error", status_co
     )
 
 
+class GatewayProcessingError(Exception):
+    """Structured error that can be returned synchronously or stored on async tasks."""
+
+    def __init__(self, message: str, error_type: str = "api_error", status_code: int = 500):
+        super().__init__(message)
+        self.message = message
+        self.error_type = error_type
+        self.status_code = status_code
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "message": self.message,
+            "type": self.error_type,
+            "status_code": self.status_code,
+        }
+
+
 # --- Endpoints ---
 
 @router.get("/models", response_model=ModelsResponse)
@@ -138,9 +162,376 @@ async def list_models(
     )
 
 
+@router.get("/tasks/{task_id}")
+async def get_async_task(
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+    _auth: bool = Depends(verify_gateway_auth)
+):
+    """Poll async gateway task status and result."""
+    task_store = TaskStore(db)
+    task = await task_store.get_task(task_id)
+    if not task:
+        return create_error_response("Task not found", "not_found", 404)
+
+    return task_to_response(task)
+
+
+async def _create_image_generation_result(
+    body: Dict[str, Any],
+    settings,
+    db: AsyncSession,
+    public_base_url: str,
+) -> Dict[str, Any]:
+    """Run a text-to-image request and return the normal OpenAI-compatible payload."""
+    if not settings.upstream_api_base or not settings.upstream_api_key:
+        raise GatewayProcessingError(
+            "Upstream API not configured. Please configure in admin settings.",
+            "configuration_error",
+            503,
+        )
+
+    prompt = body.get("prompt")
+    if not prompt:
+        raise GatewayProcessingError("Missing required field: prompt", "invalid_request", 400)
+
+    # Only forward optional parameters that the client explicitly provided.
+    # This avoids injecting DALL-E-specific defaults into GPT Image requests.
+    n = body.get("n", 1)
+    size = body.get("size", "1024x1024")
+    quality = body.get("quality")
+    style = body.get("style")
+
+    client = UpstreamClient(
+        api_base=settings.upstream_api_base,
+        api_key=settings.upstream_api_key,
+    )
+
+    add_log("INFO", f"📤 发起文生图请求: prompt={str(prompt)[:50]}...")
+
+    try:
+        upstream_response = await client.generate_image(
+            prompt=prompt,
+            model=settings.upstream_model_name or "dall-e-3",
+            n=n,
+            size=size,
+            quality=quality,
+            style=style,
+        )
+        add_log("INFO", f"📥 上游返回成功: 收到 {len(upstream_response.get('data', []))} 张图片")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Upstream API error: {e}")
+        add_log("ERROR", f"❌ 上游返回错误: HTTP {e.response.status_code}")
+        raise GatewayProcessingError(
+            f"Upstream API returned error: {e.response.status_code}",
+            "upstream_error",
+            502,
+        )
+    except httpx.RequestError as e:
+        logger.error(f"Upstream connection error: {e}")
+        add_log("ERROR", f"❌ 上游连接失败: {str(e)[:50]}")
+        raise GatewayProcessingError(
+            "Failed to connect to upstream API",
+            "connection_error",
+            502,
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error calling upstream: {e}")
+        add_log("ERROR", f"❌ 请求异常: {str(e)[:50]}")
+        raise GatewayProcessingError(
+            "Internal error processing request",
+            "internal_error",
+            500,
+        )
+
+    image_store = ImageStore(db)
+    result_data = []
+
+    for item in upstream_response.get("data", []):
+        b64_data = item.get("b64_json")
+        upstream_url = item.get("url")
+        if not b64_data and upstream_url:
+            result_data.append({
+                "url": upstream_url,
+                "revised_prompt": item.get("revised_prompt"),
+            })
+            continue
+
+        if not b64_data:
+            logger.warning("Upstream response missing b64_json/url data")
+            continue
+
+        try:
+            image = await image_store.save_from_base64(b64_data)
+            image_url = build_image_url_sync(public_base_url, image.image_id)
+
+            result_data.append({
+                "url": image_url,
+                "revised_prompt": item.get("revised_prompt"),
+            })
+
+            logger.info(f"Generated image {image.image_id}, URL: {image_url}")
+            add_log("INFO", f"文生图完成: {image.image_id[:8]}...")
+        except Exception as e:
+            logger.error(f"Failed to save image: {e}")
+            continue
+
+    if not result_data:
+        raise GatewayProcessingError(
+            "No images were generated successfully",
+            "generation_error",
+            500,
+        )
+
+    return {
+        "created": int(time.time()),
+        "data": result_data,
+    }
+
+
+async def _run_image_generation_task(
+    task_id: str,
+    body: Dict[str, Any],
+    public_base_url: str,
+) -> None:
+    """Execute an async text-to-image task after the client has received its task id."""
+    async with async_session_maker() as db:
+        task_store = TaskStore(db)
+        task = await task_store.mark_running(task_id)
+        if not task:
+            logger.warning("Async image generation task not found: %s", task_id)
+            return
+
+        add_log("INFO", f"异步文生图任务开始: {task_id[:13]}...")
+
+        try:
+            settings = await get_settings(db)
+            result = await _create_image_generation_result(body, settings, db, public_base_url)
+            await task_store.mark_succeeded(task_id, result)
+            add_log("INFO", f"异步文生图任务完成: {task_id[:13]}...")
+        except GatewayProcessingError as e:
+            await task_store.mark_failed(task_id, e.to_payload())
+            add_log("ERROR", f"异步文生图任务失败: {e.message[:50]}")
+        except Exception as e:
+            logger.exception("Async image generation task failed")
+            await task_store.mark_failed(
+                task_id,
+                {
+                    "message": "Internal error processing request",
+                    "type": "internal_error",
+                    "status_code": 500,
+                    "detail": str(e),
+                },
+            )
+            add_log("ERROR", f"异步文生图任务异常: {str(e)[:50]}")
+
+
+def _redact_task_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Avoid storing large base64 images in the async task request snapshot."""
+    redacted = dict(payload)
+    for key in ("image", "mask"):
+        value = redacted.get(key)
+        if isinstance(value, str) and len(value) > 2000:
+            redacted[key] = f"[omitted {key} data, {len(value)} chars]"
+    return redacted
+
+
+async def _create_image_edit_result(
+    body: Dict[str, Any],
+    settings,
+    db: AsyncSession,
+    public_base_url: str,
+) -> Dict[str, Any]:
+    """Run an image edit request and return the normal OpenAI-compatible payload."""
+    if not settings.upstream_api_base or not settings.upstream_api_key:
+        add_log("ERROR", "❌ 图片编辑失败: 上游 API 未配置")
+        raise GatewayProcessingError(
+            "Upstream API not configured. Please configure in admin settings.",
+            "configuration_error",
+            503,
+        )
+
+    if not body.get("image"):
+        add_log("ERROR", "❌ 图片编辑失败: 缺少 image 参数")
+        raise GatewayProcessingError("Missing required field: image", "invalid_request", 400)
+    if not body.get("prompt"):
+        add_log("ERROR", "❌ 图片编辑失败: 缺少 prompt 参数")
+        raise GatewayProcessingError("Missing required field: prompt", "invalid_request", 400)
+
+    add_log("INFO", f"📤 发起图片编辑请求: prompt={body['prompt'][:50]}...")
+
+    def preserve_image_url(value):
+        if isinstance(value, str) and value.startswith(("http://", "https://", "data:image/")):
+            return value
+        return None
+
+    source_image_url = preserve_image_url(body.get("image"))
+    source_mask_url = preserve_image_url(body.get("mask"))
+
+    rewriter = await create_rewriter(db, settings)
+
+    try:
+        rewritten_body = await rewriter.rewrite(body)
+    except ValueError as e:
+        add_log("ERROR", f"❌ 图片编辑安全校验失败: {str(e)[:50]}")
+        raise GatewayProcessingError(str(e), "security_error", 400)
+    except Exception as e:
+        logger.error(f"Payload rewriting failed: {e}")
+        add_log("ERROR", f"❌ 图片编辑预处理失败: {str(e)[:50]}")
+        raise GatewayProcessingError(
+            f"Failed to process image URLs: {e}",
+            "processing_error",
+            400,
+        )
+
+    image_base64 = rewritten_body.get("image")
+    mask_base64 = rewritten_body.get("mask")
+    prompt = rewritten_body.get("prompt")
+    n = rewritten_body.get("n", 1)
+    size = rewritten_body.get("size", "1024x1024")
+
+    if image_base64 and image_base64.startswith("data:"):
+        image_base64 = image_base64.split(",", 1)[1] if "," in image_base64 else image_base64
+    if mask_base64 and mask_base64.startswith("data:"):
+        mask_base64 = mask_base64.split(",", 1)[1] if "," in mask_base64 else mask_base64
+
+    client = UpstreamClient(
+        api_base=settings.upstream_api_base,
+        api_key=settings.upstream_api_key,
+    )
+
+    try:
+        upstream_response = await client.edit_image(
+            image_base64=image_base64,
+            prompt=prompt,
+            model=settings.upstream_model_name or "dall-e-2",
+            mask_base64=mask_base64,
+            n=n,
+            size=size,
+            source_image_url=source_image_url,
+            source_mask_url=source_mask_url,
+        )
+        add_log("INFO", f"📥 图片编辑上游返回成功: 收到 {len(upstream_response.get('data', []))} 张图片")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Upstream API error: {e}")
+        try:
+            error_detail = e.response.json().get("error", {}).get("message", str(e))
+        except Exception:
+            error_detail = str(e.response.status_code)
+        add_log("ERROR", f"❌ 图片编辑上游错误: {error_detail[:50]}")
+        raise GatewayProcessingError(
+            f"Upstream API error: {error_detail}",
+            "upstream_error",
+            502,
+        )
+    except httpx.RequestError as e:
+        logger.error(f"Upstream connection error: {e}")
+        add_log("ERROR", f"❌ 图片编辑上游连接失败: {str(e)[:50]}")
+        raise GatewayProcessingError(
+            "Failed to connect to upstream API",
+            "connection_error",
+            502,
+        )
+    except Exception as e:
+        logger.exception("Unexpected error calling upstream")
+        add_log("ERROR", f"❌ 图片编辑请求异常: {type(e).__name__}: {str(e)[:50]}")
+        raise GatewayProcessingError(
+            f"Internal error processing request: {type(e).__name__}: {e}",
+            "internal_error",
+            500,
+        )
+
+    image_store = ImageStore(db)
+    result_data = []
+
+    for item in upstream_response.get("data", []):
+        b64_data = item.get("b64_json")
+        upstream_url = item.get("url")
+        if not b64_data and upstream_url:
+            result_data.append({
+                "url": upstream_url,
+                "revised_prompt": item.get("revised_prompt"),
+            })
+            continue
+
+        if not b64_data:
+            logger.warning("Upstream response missing b64_json/url data")
+            add_log("WARNING", "⚠️ 图片编辑上游返回缺少图片数据")
+            continue
+
+        try:
+            image = await image_store.save_from_base64(b64_data)
+            image_url = build_image_url_sync(public_base_url, image.image_id)
+
+            result_data.append({
+                "url": image_url,
+                "revised_prompt": item.get("revised_prompt"),
+            })
+
+            logger.info(f"Edited image saved as {image.image_id}, URL: {image_url}")
+            add_log("INFO", f"图片编辑结果已保存: {image.image_id[:8]}...")
+        except Exception as e:
+            logger.error(f"Failed to save edited image: {e}")
+            add_log("ERROR", f"❌ 保存编辑结果失败: {str(e)[:50]}")
+            continue
+
+    if not result_data:
+        add_log("ERROR", "❌ 图片编辑失败: 没有成功生成图片")
+        raise GatewayProcessingError(
+            "No images were generated successfully",
+            "generation_error",
+            500,
+        )
+
+    add_log("INFO", f"图片编辑完成: 返回 {len(result_data)} 张图片")
+
+    return {
+        "created": int(time.time()),
+        "data": result_data,
+    }
+
+
+async def _run_image_edit_task(
+    task_id: str,
+    body: Dict[str, Any],
+    public_base_url: str,
+) -> None:
+    """Execute an async image edit task after the client has received its task id."""
+    async with async_session_maker() as db:
+        task_store = TaskStore(db)
+        task = await task_store.mark_running(task_id)
+        if not task:
+            logger.warning("Async image edit task not found: %s", task_id)
+            return
+
+        add_log("INFO", f"异步图片编辑任务开始: {task_id[:13]}...")
+
+        try:
+            settings = await get_settings(db)
+            result = await _create_image_edit_result(body, settings, db, public_base_url)
+            await task_store.mark_succeeded(task_id, result)
+            add_log("INFO", f"异步图片编辑任务完成: {task_id[:13]}...")
+        except GatewayProcessingError as e:
+            await task_store.mark_failed(task_id, e.to_payload())
+            add_log("ERROR", f"异步图片编辑任务失败: {e.message[:50]}")
+        except Exception as e:
+            logger.exception("Async image edit task failed")
+            await task_store.mark_failed(
+                task_id,
+                {
+                    "message": "Internal error processing request",
+                    "type": "internal_error",
+                    "status_code": 500,
+                    "detail": str(e),
+                },
+            )
+            add_log("ERROR", f"异步图片编辑任务异常: {str(e)[:50]}")
+
+
 @router.post("/images/generations")
 async def create_image(
     request: Request,
+    async_mode: bool = Query(False, alias="async"),
     db: AsyncSession = Depends(get_db),
     _auth: bool = Depends(verify_gateway_auth)
 ):
@@ -154,130 +545,46 @@ async def create_image(
     4. Return URLs pointing to our /images/{id} endpoint
     """
     settings = await get_settings(db)
-    
-    # Validate upstream configuration
-    if not settings.upstream_api_base or not settings.upstream_api_key:
-        return create_error_response(
-            "Upstream API not configured. Please configure in admin settings.",
-            "configuration_error",
-            503
-        )
-    
-    # Parse request body
+
     try:
         body = await request.json()
     except Exception as e:
         return create_error_response(f"Invalid JSON body: {e}", "invalid_request", 400)
-    
-    prompt = body.get("prompt")
-    if not prompt:
-        return create_error_response("Missing required field: prompt", "invalid_request", 400)
-    
-    # Only forward optional parameters that the client explicitly provided.
-    # This avoids injecting DALL-E-specific defaults into GPT Image requests.
-    n = body.get("n", 1)
-    size = body.get("size", "1024x1024")
-    quality = body.get("quality")
-    style = body.get("style")
-    
-    # Create upstream client
-    client = UpstreamClient(
-        api_base=settings.upstream_api_base,
-        api_key=settings.upstream_api_key
-    )
-    
-    add_log("INFO", f"📤 发起文生图请求: prompt={prompt[:50]}...")
-    
-    try:
-        # Call upstream API (always requests b64_json)
-        upstream_response = await client.generate_image(
-            prompt=prompt,
-            model=settings.upstream_model_name or "dall-e-3",
-            n=n,
-            size=size,
-            quality=quality,
-            style=style
-        )
-        add_log("INFO", f"📥 上游返回成功: 收到 {len(upstream_response.get('data', []))} 张图片")
-    except httpx.HTTPStatusError as e:
-        logger.error(f"Upstream API error: {e}")
-        add_log("ERROR", f"❌ 上游返回错误: HTTP {e.response.status_code}")
-        return create_error_response(
-            f"Upstream API returned error: {e.response.status_code}",
-            "upstream_error",
-            502
-        )
-    except httpx.RequestError as e:
-        logger.error(f"Upstream connection error: {e}")
-        add_log("ERROR", f"❌ 上游连接失败: {str(e)[:50]}")
-        return create_error_response(
-            "Failed to connect to upstream API",
-            "connection_error",
-            502
-        )
-    except Exception as e:
-        logger.error(f"Unexpected error calling upstream: {e}")
-        add_log("ERROR", f"❌ 请求异常: {str(e)[:50]}")
-        return create_error_response(
-            "Internal error processing request",
-            "internal_error",
-            500
-        )
-    
-    # Process response - save images and build URLs
-    image_store = ImageStore(db)
-    result_data = []
-    
-    for item in upstream_response.get("data", []):
-        b64_data = item.get("b64_json")
-        upstream_url = item.get("url")
-        if not b64_data and upstream_url:
-            result_data.append({
-                "url": upstream_url,
-                "revised_prompt": item.get("revised_prompt")  # Pass through if present
-            })
-            continue
 
-        if not b64_data:
-            logger.warning("Upstream response missing b64_json/url data")
-            continue
-        
-        try:
-            # Save to local storage
-            image = await image_store.save_from_base64(b64_data)
-            
-            # Build public URL
-            image_url = await build_image_url(request, db, image.image_id)
-            
-            result_data.append({
-                "url": image_url,
-                "revised_prompt": item.get("revised_prompt")  # Pass through if present
-            })
-            
-            logger.info(f"Generated image {image.image_id}, URL: {image_url}")
-            add_log("INFO", f"文生图完成: {image.image_id[:8]}...")
-            
-        except Exception as e:
-            logger.error(f"Failed to save image: {e}")
-            continue
-    
-    if not result_data:
-        return create_error_response(
-            "No images were generated successfully",
-            "generation_error",
-            500
-        )
-    
-    # Return OpenAI-compatible response
-    return {
-        "created": int(time.time()),
-        "data": result_data
-    }
+    try:
+        public_base_url = await get_public_base_url(request, db)
+
+        if async_mode:
+            # Validate before accepting the async task so clients get immediate 4xx/5xx
+            # for malformed requests or missing configuration.
+            if not settings.upstream_api_base or not settings.upstream_api_key:
+                raise GatewayProcessingError(
+                    "Upstream API not configured. Please configure in admin settings.",
+                    "configuration_error",
+                    503,
+                )
+            if not body.get("prompt"):
+                raise GatewayProcessingError("Missing required field: prompt", "invalid_request", 400)
+
+            task_store = TaskStore(db)
+            task = await task_store.create_task("images.generations", body)
+            asyncio.create_task(_run_image_generation_task(task.task_id, body, public_base_url))
+
+            api_base_url = infer_base_url_from_request(request).rstrip("/")
+            response = task_to_response(task)
+            response["poll_url"] = f"{api_base_url}/v1/tasks/{task.task_id}"
+            add_log("INFO", f"已创建异步文生图任务: {task.task_id[:13]}...")
+            return JSONResponse(status_code=202, content=response)
+
+        return await _create_image_generation_result(body, settings, db, public_base_url)
+    except GatewayProcessingError as e:
+        return create_error_response(e.message, e.error_type, e.status_code)
 
 
 @router.post("/images/edits")
 async def edit_image(
     request: Request,
+    async_mode: bool = Query(False, alias="async"),
     db: AsyncSession = Depends(get_db),
     _auth: bool = Depends(verify_gateway_auth)
 ):
@@ -297,158 +604,42 @@ async def edit_image(
     - n, size: Standard generation parameters
     """
     settings = await get_settings(db)
-    
-    # Validate upstream configuration
-    if not settings.upstream_api_base or not settings.upstream_api_key:
-        return create_error_response(
-            "Upstream API not configured. Please configure in admin settings.",
-            "configuration_error",
-            503
-        )
-    
-    # Parse request body
+
     try:
         body = await request.json()
     except Exception as e:
+        add_log("ERROR", f"❌ 图片编辑请求体无效: {str(e)[:50]}")
         return create_error_response(f"Invalid JSON body: {e}", "invalid_request", 400)
-    
-    # Validate required fields
-    if not body.get("image"):
-        return create_error_response("Missing required field: image", "invalid_request", 400)
-    if not body.get("prompt"):
-        return create_error_response("Missing required field: prompt", "invalid_request", 400)
 
-    def preserve_image_url(value):
-        if isinstance(value, str) and value.startswith(("http://", "https://", "data:image/")):
-            return value
-        return None
-
-    source_image_url = preserve_image_url(body.get("image"))
-    source_mask_url = preserve_image_url(body.get("mask"))
-    
-    # Create payload rewriter to convert URLs to base64
-    rewriter = await create_rewriter(db, settings)
-    
     try:
-        # Rewrite the entire body - converts image/mask URLs to base64
-        rewritten_body = await rewriter.rewrite(body)
-    except ValueError as e:
-        # External image fetch not allowed
-        return create_error_response(str(e), "security_error", 400)
-    except Exception as e:
-        logger.error(f"Payload rewriting failed: {e}")
-        return create_error_response(
-            f"Failed to process image URLs: {e}",
-            "processing_error",
-            400
-        )
-    
-    # Extract parameters
-    image_base64 = rewritten_body.get("image")
-    mask_base64 = rewritten_body.get("mask")
-    prompt = rewritten_body.get("prompt")
-    n = rewritten_body.get("n", 1)
-    size = rewritten_body.get("size", "1024x1024")
-    
-    # Strip data URL prefix if present (upstream expects raw base64)
-    if image_base64 and image_base64.startswith("data:"):
-        image_base64 = image_base64.split(",", 1)[1] if "," in image_base64 else image_base64
-    if mask_base64 and mask_base64.startswith("data:"):
-        mask_base64 = mask_base64.split(",", 1)[1] if "," in mask_base64 else mask_base64
-    
-    # Create upstream client
-    client = UpstreamClient(
-        api_base=settings.upstream_api_base,
-        api_key=settings.upstream_api_key
-    )
-    
-    try:
-        # Call upstream API for image editing
-        upstream_response = await client.edit_image(
-            image_base64=image_base64,
-            prompt=prompt,
-            model=settings.upstream_model_name or "dall-e-2",
-            mask_base64=mask_base64,
-            n=n,
-            size=size,
-            source_image_url=source_image_url,
-            source_mask_url=source_mask_url
-        )
-    except httpx.HTTPStatusError as e:
-        logger.error(f"Upstream API error: {e}")
-        # Try to extract error message from response
-        try:
-            error_detail = e.response.json().get("error", {}).get("message", str(e))
-        except Exception:
-            error_detail = str(e.response.status_code)
-        return create_error_response(
-            f"Upstream API error: {error_detail}",
-            "upstream_error",
-            502
-        )
-    except httpx.RequestError as e:
-        logger.error(f"Upstream connection error: {e}")
-        return create_error_response(
-            "Failed to connect to upstream API",
-            "connection_error",
-            502
-        )
-    except Exception as e:
-        logger.exception("Unexpected error calling upstream")
-        return create_error_response(
-            f"Internal error processing request: {type(e).__name__}: {e}",
-            "internal_error",
-            500
-        )
-    
-    # Process response - save images and build URLs
-    image_store = ImageStore(db)
-    result_data = []
-    
-    for item in upstream_response.get("data", []):
-        b64_data = item.get("b64_json")
-        upstream_url = item.get("url")
-        if not b64_data and upstream_url:
-            result_data.append({
-                "url": upstream_url,
-                "revised_prompt": item.get("revised_prompt")
-            })
-            continue
+        public_base_url = await get_public_base_url(request, db)
 
-        if not b64_data:
-            logger.warning("Upstream response missing b64_json/url data")
-            continue
-        
-        try:
-            # Save to local storage
-            image = await image_store.save_from_base64(b64_data)
-            
-            # Build public URL
-            image_url = await build_image_url(request, db, image.image_id)
-            
-            result_data.append({
-                "url": image_url,
-                "revised_prompt": item.get("revised_prompt")
-            })
-            
-            logger.info(f"Edited image saved as {image.image_id}, URL: {image_url}")
-            
-        except Exception as e:
-            logger.error(f"Failed to save edited image: {e}")
-            continue
-    
-    if not result_data:
-        return create_error_response(
-            "No images were generated successfully",
-            "generation_error",
-            500
-        )
-    
-    # Return OpenAI-compatible response
-    return {
-        "created": int(time.time()),
-        "data": result_data
-    }
+        if async_mode:
+            # Validate cheap failures before returning a task id.
+            if not settings.upstream_api_base or not settings.upstream_api_key:
+                raise GatewayProcessingError(
+                    "Upstream API not configured. Please configure in admin settings.",
+                    "configuration_error",
+                    503,
+                )
+            if not body.get("image"):
+                raise GatewayProcessingError("Missing required field: image", "invalid_request", 400)
+            if not body.get("prompt"):
+                raise GatewayProcessingError("Missing required field: prompt", "invalid_request", 400)
+
+            task_store = TaskStore(db)
+            task = await task_store.create_task("images.edits", _redact_task_request(body))
+            asyncio.create_task(_run_image_edit_task(task.task_id, body, public_base_url))
+
+            api_base_url = infer_base_url_from_request(request).rstrip("/")
+            response = task_to_response(task)
+            response["poll_url"] = f"{api_base_url}/v1/tasks/{task.task_id}"
+            add_log("INFO", f"已创建异步图片编辑任务: {task.task_id[:13]}...")
+            return JSONResponse(status_code=202, content=response)
+
+        return await _create_image_edit_result(body, settings, db, public_base_url)
+    except GatewayProcessingError as e:
+        return create_error_response(e.message, e.error_type, e.status_code)
 
 
 @router.post("/chat/completions")

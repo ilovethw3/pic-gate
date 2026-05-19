@@ -4,8 +4,6 @@ on:
   push:
     tags:
       - "v*"
-  release:
-    types: [published]
 
 env:
   IMAGE_NAME: candy0327/pic-gate

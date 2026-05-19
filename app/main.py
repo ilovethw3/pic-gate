@@ -11,8 +11,9 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
 from app.config import HOST, PORT, IMAGES_DIR
-from app.db import init_db
+from app.db import async_session_maker, init_db
 from app.routers import gateway_openai, images, admin_pages, admin_api
+from app.services.task_store import mark_incomplete_tasks_failed
 
 # Configure logging
 logging.basicConfig(
@@ -28,6 +29,10 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting PicGate...")
     await init_db()
+    async with async_session_maker() as db:
+        interrupted_count = await mark_incomplete_tasks_failed(db)
+        if interrupted_count:
+            logger.warning("Marked %s interrupted async tasks as failed", interrupted_count)
     logger.info(f"Database initialized")
     logger.info(f"Images directory: {IMAGES_DIR}")
     yield

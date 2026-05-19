@@ -90,3 +90,24 @@ class Image(Base):
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow)
     last_accessed_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AsyncTask(Base):
+    """
+    Background task state for async gateway requests.
+    Stores JSON as text to keep SQLite compatibility simple.
+    """
+    __tablename__ = "async_tasks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String(64), unique=True, nullable=False, index=True)
+    task_type = Column(String(50), nullable=False, index=True)
+    status = Column(String(20), default="queued", nullable=False, index=True)
+
+    request_json = Column(Text, default="")
+    result_json = Column(Text, default="")
+    error_json = Column(Text, default="")
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
