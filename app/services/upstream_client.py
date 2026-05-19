@@ -164,8 +164,10 @@ class UpstreamClient:
             prompt: Edit instructions
             model: Model name
             mask_base64: Optional base64-encoded mask
-            source_image_url: Original image URL from the client, if available
-            source_mask_url: Original mask URL from the client, if available
+            source_image_url: Original image URL from the client, kept for compatibility.
+                PicGate still sends converted image data upstream to avoid signed URL
+                downloads failing on the provider side.
+            source_mask_url: Original mask URL from the client, kept for compatibility.
             
         Returns:
             Response dict with 'created' and 'data' containing base64 images
@@ -196,13 +198,13 @@ class UpstreamClient:
             "response_format": "b64_json",
             "images": [
                 {
-                    "image_url": source_image_url or self._to_data_image_url(image_base64)
+                    "image_url": self._to_data_image_url(image_base64)
                 }
             ],
         }
 
         if mask_base64:
-            image_url_payload["mask"] = source_mask_url or self._to_data_image_url(mask_base64)
+            image_url_payload["mask"] = self._to_data_image_url(mask_base64)
 
         for key, value in kwargs.items():
             if value is not None:
@@ -211,23 +213,6 @@ class UpstreamClient:
         logger.info(f"Editing image with prompt: {prompt[:50]}...")
         
         async with httpx.AsyncClient(timeout=self.timeout, trust_env=self.trust_env) as client:
-            if source_image_url:
-                response = await client.post(
-                    url,
-                    json=image_url_payload,
-                    headers=self._get_headers()
-                )
-
-                if response.status_code == 200:
-                    return response.json()
-
-                logger.error(
-                    "Image URL edit payload failed: %s - %s",
-                    response.status_code,
-                    response.text
-                )
-                response.raise_for_status()
-
             response = await client.post(
                 url,
                 json=legacy_payload,
