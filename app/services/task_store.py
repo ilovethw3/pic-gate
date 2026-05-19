@@ -89,7 +89,6 @@ class TaskStore:
         )
         self.db.add(task)
         await self.db.commit()
-        await self.db.refresh(task)
         return task
 
     async def get_task(self, task_id: str) -> Optional[AsyncTask]:
@@ -106,7 +105,6 @@ class TaskStore:
         task.status = "running"
         task.started_at = datetime.utcnow()
         await self.db.commit()
-        await self.db.refresh(task)
         return task
 
     async def mark_succeeded(self, task_id: str, result_payload: Dict[str, Any]) -> Optional[AsyncTask]:
@@ -119,7 +117,6 @@ class TaskStore:
         task.error_json = ""
         task.finished_at = datetime.utcnow()
         await self.db.commit()
-        await self.db.refresh(task)
         return task
 
     async def mark_failed(self, task_id: str, error_payload: Dict[str, Any]) -> Optional[AsyncTask]:
@@ -131,5 +128,4 @@ class TaskStore:
         task.error_json = _json_dump(error_payload)
         task.finished_at = datetime.utcnow()
         await self.db.commit()
-        await self.db.refresh(task)
         return task
